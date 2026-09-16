@@ -349,3 +349,285 @@ fn current_unix_i64() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use prost::Message;
+
+    /// End-to-end live MARTA test.
+    ///
+    /// This test:
+    /// 1. Downloads the current MARTA static GTFS.
+    /// 2. Builds the MARTA rail schedule index.
+    /// 3. Fetches the live MARTA rail API.
+    /// 4. Matches realtime trains to GTFS trips.
+    /// 5. Generates GTFS-RT TripUpdates and VehiclePositions.
+    /// 6. Verifies that the generated protobuf messages serialize.
+    ///
+    /// Run with:
+    ///
+    /// MARTA_API_KEY="your-key" \
+    /// cargo test live_marta_end_to_end -- --ignored --nocapture
+    ///
+    /// It is ignored by default because it requires network access and an API key.
+    #[tokio::test]
+    #[ignore]
+    async fn live_marta_end_to_end() {
+        const GTFS_URL: &str =
+            "https://itsmarta.com/google_transit_feed/google_transit.zip";
+
+        println!("======================================================");
+        println!("MARTA GTFS-RT LIVE END-TO-END TEST");
+        println!("======================================================");
+
+        let api_key = std::env::var("MARTA_API_KEY")
+            .expect("MARTA_API_KEY environment variable must be set");
+
+        println!("1. Downloading static MARTA GTFS...");
+        println!("   {GTFS_URL}");
+
+        let gtfs = gtfs_structures::Gtfs::from_url_async(GTFS_URL)
+            .await
+            .expect("failed to download or parse MARTA static GTFS");
+
+        println!("   GTFS loaded successfully");
+        println!("   routes: {}", gtfs.routes.len());
+        println!("   trips:  {}", gtfs.trips.len());
+        println!("   stops:  {}", gtfs.stops.len());
+
+        assert!(
+            !gtfs.routes.is_empty(),
+            "MARTA static GTFS contained no routes"
+        );
+        assert!(
+            !gtfs.trips.is_empty(),
+            "MARTA static GTFS contained no trips"
+        );
+        assert!(
+            !gtfs.stops.is_empty(),
+            "MARTA static GTFS contained no stops"
+        );
+
+        println!();
+        println!("2. Building MARTA schedule index...");
+
+        let converter = MartaGtfsRt::new(&gtfs);
+
+        println!("   schedule index built successfully");
+
+        println!();
+        println!("3. Fetching MARTA realtime API...");
+        println!("   {}", MARTA_RAIL_REALTIME_URL);
+
+        let client = reqwest::Client::builder()
+            .user_agent("marta-gtfs-rt-live-test/0.1")
+            .build()
+            .expect("failed to build reqwest client");
+
+        let result = converter
+            .fetch(&client, &api_key)
+            .await
+            .expect("MARTA realtime fetch/conversion failed");
+
+        println!();
+        println!("4. Diagnostics");
+        println!("------------------------------------------------------");
+        println!(
+            "received rows:             {}",
+            result.diagnostics.received_rows
+        );
+        println!(
+            "ignored non-realtime rows: {}",
+            result.diagnostics.ignored_non_realtime_rows
+        );
+        println!(
+            "matched trains:            {}",
+            result.diagnostics.matched_trains
+        );
+        println!(
+            "unmatched trains:          {}",
+            result.diagnostics.unmatched_trains
+        );
+
+        if !result.diagnostics.unmatched_train_ids.is_empty() {
+            println!(
+                "unmatched train IDs:       {:?}",
+                result.diagnostics.unmatched_train_ids
+            );
+        }
+
+        println!();
+        println!("5. GTFS-Realtime output");
+        println!("------------------------------------------------------");
+        println!(
+            "TripUpdate entities:       {}",
+            result.trip_updates.entity.len()
+        );
+        println!(
+            "VehiclePosition entities:  {}",
+            result.vehicle_positions.entity.len()
+        );
+        println!(
+            "Alert entities:            {}",
+            result.alerts.entity.len()
+        );
+
+        /*
+         * Every successfully matched train currently produces exactly:
+         *
+         *   1 TripUpdate
+         *   1 VehiclePosition
+         */
+        assert_eq!(
+            result.trip_updates.entity.len(),
+            result.diagnostics.matched_trains,
+            "matched train count does not equal TripUpdate count"
+        );
+
+        assert_eq!(
+            result.vehicle_positions.entity.len(),
+            result.diagnostics.matched_trains,
+            "matched train count does not equal VehiclePosition count"
+        );
+
+        println!();
+        println!("6. Inspecting matched trips");
+        println!("------------------------------------------------------");
+
+        for entity in &result.trip_updates.entity {
+            let trip_update = entity
+                .trip_update
+                .as_ref()
+                .expect("TripUpdate entity did not contain TripUpdate");
+
+            let trip_id = trip_update
+                .trip
+                .trip_id
+                .as_deref()
+                .unwrap_or("<missing>");
+
+            let route_id = trip_update
+                .trip
+                .route_id
+                .as_deref()
+                .unwrap_or("<missing>");
+
+            let start_date = trip_update
+                .trip
+                .start_date
+                .as_deref()
+                .unwrap_or("<missing>");
+
+            println!(
+                "entity={} trip={} route={} date={} stops={}",
+                entity.id,
+                trip_id,
+                route_id,
+                start_date,
+                trip_update.stop_time_update.len()
+            );
+
+            assert!(
+                trip_update.trip.trip_id.is_some(),
+                "matched TripUpdate has no trip_id"
+            );
+
+            assert!(
+                trip_update.trip.route_id.is_some(),
+                "matched TripUpdate has no route_id"
+            );
+
+            assert!(
+                trip_update.trip.start_date.is_some(),
+                "matched TripUpdate has no start_date"
+            );
+
+            for stop in &trip_update.stop_time_update {
+                println!(
+                    "    seq={:?} stop={:?} arrival={:?}",
+                    stop.stop_sequence,
+                    stop.stop_id,
+                    stop.arrival
+                        .as_ref()
+                        .and_then(|arrival| arrival.time)
+                );
+
+                assert!(
+                    stop.stop_id.is_some(),
+                    "StopTimeUpdate is missing stop_id"
+                );
+
+                assert!(
+                    stop.arrival
+                        .as_ref()
+                        .and_then(|arrival| arrival.time)
+                        .is_some(),
+                    "StopTimeUpdate is missing predicted arrival time"
+                );
+            }
+        }
+
+        println!();
+        println!("7. Testing protobuf serialization...");
+
+        let trip_update_bytes = result.trip_updates.encode_to_vec();
+        let vehicle_bytes = result.vehicle_positions.encode_to_vec();
+        let alert_bytes = result.alerts.encode_to_vec();
+
+        println!(
+            "   TripUpdates:      {} bytes",
+            trip_update_bytes.len()
+        );
+        println!(
+            "   VehiclePositions: {} bytes",
+            vehicle_bytes.len()
+        );
+        println!(
+            "   Alerts:           {} bytes",
+            alert_bytes.len()
+        );
+
+        assert!(
+            !trip_update_bytes.is_empty(),
+            "TripUpdate protobuf serialization produced zero bytes"
+        );
+
+        assert!(
+            !vehicle_bytes.is_empty(),
+            "VehiclePosition protobuf serialization produced zero bytes"
+        );
+
+        /*
+         * This is deliberately strict.
+         *
+         * If the endpoint returned realtime observations but we matched zero
+         * trains, the schedule matcher probably needs investigation.
+         *
+         * If MARTA is outside service hours and returns zero rows, this gives
+         * you a distinct error instead.
+         */
+        assert!(
+            result.diagnostics.received_rows > 0,
+            "MARTA returned zero realtime rows. The library/API may be fine, \
+             but rerun this test while MARTA rail service is operating."
+        );
+
+        assert!(
+            result.diagnostics.matched_trains > 0,
+            "MARTA returned realtime data, but ZERO trains matched the static \
+             GTFS schedule. Check the matching algorithm and diagnostic output above."
+        );
+
+        println!();
+        println!("======================================================");
+        println!("SUCCESS");
+        println!(
+            "{} realtime rows -> {} matched trains -> {} TripUpdates",
+            result.diagnostics.received_rows,
+            result.diagnostics.matched_trains,
+            result.trip_updates.entity.len()
+        );
+        println!("======================================================");
+    }
+}
