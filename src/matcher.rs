@@ -1,8 +1,8 @@
 use crate::index::{normalize_line, normalize_station_name, MartaScheduleIndex, StationId, TripIndex};
 use crate::models::MartaTrainRow;
-use crate::time::{parse_delay_seconds, parse_event_time, parse_next_arrival};
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime};
-use chrono_tz::Tz;
+use crate::time::{MARTA_TIMEZONE, parse_delay_seconds, parse_event_time, parse_next_arrival};
+use jiff::civil::{Date, DateTime};
+use jiff::{SignedDuration, Span, Timestamp};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -33,15 +33,15 @@ impl Default for MatcherConfig {
 pub(crate) struct Observation {
     pub row_index: usize,
     pub station_candidates: Vec<StationId>,
-    pub event_time: DateTime<Tz>,
-    pub predicted_arrival: DateTime<Tz>,
-    pub scheduled_local: NaiveDateTime,
+    pub event_time: Timestamp,
+    pub predicted_arrival: Timestamp,
+    pub scheduled_local: DateTime,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct MatchScore {
     pub trip_index: TripIndex,
-    pub service_date: NaiveDate,
+    pub service_date: Date,
     pub row_stop_positions: Vec<(usize, usize)>, // (realtime row index, trip stop index)
     pub mean_abs_error_seconds: i64,
     pub max_abs_error_seconds: i64,
@@ -78,7 +78,10 @@ pub(crate) fn build_observations(
             let waiting_seconds = row.waiting_seconds.trim().parse::<i64>().ok();
             let predicted_arrival = parse_next_arrival(&event_time, &row.next_arr, waiting_seconds)?;
             let delay_seconds = parse_delay_seconds(&row.delay)?;
-            let scheduled_local = predicted_arrival.naive_local() - Duration::seconds(delay_seconds);
+            let scheduled_local = MARTA_TIMEZONE
+                .to_datetime(predicted_arrival)
+                .checked_add(SignedDuration::from_secs(delay_seconds.checked_neg()?))
+                .ok()?;
             let station_candidates = resolve_station(index, &row.station);
             if station_candidates.is_empty() {
                 return None;
@@ -93,7 +96,7 @@ pub(crate) fn build_observations(
         })
         .collect::<Vec<_>>();
 
-    observations.sort_by_key(|obs| obs.predicted_arrival.timestamp());
+    observations.sort_by_key(|obs| obs.predicted_arrival.as_second());
 
     // Keep one prediction per station occurrence. The API can occasionally repeat a row;
     // retaining duplicates would incorrectly require the GTFS pattern to visit a station twice.
@@ -109,7 +112,7 @@ pub(crate) fn match_train(
     index: &MartaScheduleIndex,
     rows: &[MartaTrainRow],
     config: &MatcherConfig,
-    preferred_trip: Option<(TripIndex, NaiveDate)>,
+    preferred_trip: Option<(TripIndex, Date)>,
 ) -> Option<MatchScore> {
     let line = rows.first().map(|row| normalize_line(&row.line))?;
     let destination = rows
@@ -160,12 +163,10 @@ pub(crate) fn match_train(
         .min_by_key(|(postings, _)| *postings)
         .map(|(_, observation)| observation)?;
 
-    let mut candidate_pairs = HashSet::<(TripIndex, NaiveDate)>::new();
+    let mut candidate_pairs = HashSet::<(TripIndex, Date)>::new();
     for service_date in candidate_dates {
-        let Some(midnight) = service_date.and_hms_opt(0, 0, 0) else {
-            continue;
-        };
-        let target_seconds = (anchor.scheduled_local - midnight).num_seconds();
+        let midnight = service_date.at(0, 0, 0, 0);
+        let target_seconds = anchor.scheduled_local.duration_since(midnight).as_secs();
         for station_id in &anchor.station_candidates {
             for posting in index.trip_candidates_at(
                 &line,
@@ -218,7 +219,7 @@ pub(crate) fn match_train(
 fn score_specific_trip(
     index: &MartaScheduleIndex,
     trip_index: TripIndex,
-    service_date: NaiveDate,
+    service_date: Date,
     line: &str,
     destination: &str,
     observations: &[Observation],
@@ -288,20 +289,22 @@ fn count_skipped_stops(alignment: &[(usize, usize)]) -> usize {
 
 fn score_schedule(
     trip: &crate::index::IndexedTrip,
-    service_date: NaiveDate,
+    service_date: Date,
     alignment: &[(usize, usize)],
     observations: &[Observation],
 ) -> Option<(i64, i64)> {
-    let midnight = service_date.and_hms_opt(0, 0, 0)?;
+    let midnight = service_date.at(0, 0, 0, 0);
     let mut total = 0i128;
     let mut count = 0i64;
     let mut max = 0i64;
 
     for &(observation_index, stop_index) in alignment {
         let scheduled_seconds = trip.arrival_seconds.get(stop_index).copied().flatten()?;
-        let gtfs_local = midnight + Duration::seconds(scheduled_seconds as i64);
+        let gtfs_local = midnight
+            .checked_add(SignedDuration::from_secs(i64::from(scheduled_seconds)))
+            .ok()?;
         let observed_local = observations.get(observation_index)?.scheduled_local;
-        let difference = (observed_local - gtfs_local).num_seconds().abs();
+        let difference = observed_local.duration_since(gtfs_local).as_secs().abs();
         total += difference as i128;
         count += 1;
         max = max.max(difference);
@@ -313,15 +316,17 @@ fn score_schedule(
     Some(((total / count as i128) as i64, max))
 }
 
-fn candidate_service_dates(observations: &[Observation]) -> Vec<NaiveDate> {
+fn candidate_service_dates(observations: &[Observation]) -> Vec<Date> {
     let mut dates = HashSet::new();
     for observation in observations {
-        let event_date = observation.event_time.date_naive();
+        let event_date = MARTA_TIMEZONE.to_datetime(observation.event_time).date();
         let scheduled_date = observation.scheduled_local.date();
-        dates.insert(event_date);
-        dates.insert(event_date - Duration::days(1));
-        dates.insert(scheduled_date);
-        dates.insert(scheduled_date - Duration::days(1));
+        for date in [event_date, scheduled_date] {
+            dates.insert(date);
+            if let Ok(previous) = date.checked_sub(Span::new().days(1)) {
+                dates.insert(previous);
+            }
+        }
     }
     let mut dates = dates.into_iter().collect::<Vec<_>>();
     dates.sort_unstable();
@@ -370,4 +375,30 @@ pub(crate) fn group_live_rows(rows: Vec<MartaTrainRow>) -> (Vec<Vec<MartaTrainRo
     }
 
     (groups.into_values().collect(), ignored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jiff::civil::date;
+
+    #[test]
+    fn after_midnight_retains_previous_service_date() {
+        let event_time = parse_event_time("09/16/2026 12:01:00 AM").unwrap();
+        let predicted_arrival = parse_next_arrival(&event_time, "12:04:00 AM", Some(180)).unwrap();
+        let scheduled_local = MARTA_TIMEZONE.to_datetime(predicted_arrival);
+        let observation = Observation {
+            row_index: 0,
+            station_candidates: vec![],
+            event_time,
+            predicted_arrival,
+            scheduled_local,
+        };
+        assert_eq!(
+            candidate_service_dates(&[observation]),
+            vec![date(2026, 9, 15), date(2026, 9, 16)]
+        );
+        let previous_midnight = date(2026, 9, 15).at(0, 0, 0, 0);
+        assert_eq!(scheduled_local.duration_since(previous_midnight).as_secs(), 86_640);
+    }
 }

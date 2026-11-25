@@ -1,4 +1,4 @@
-use chrono::{Datelike, NaiveDate, Weekday};
+use jiff::civil::{Date, Weekday};
 use gtfs_structures::{DirectionType, Exception, Gtfs, RouteType};
 use std::collections::{HashMap, HashSet};
 
@@ -34,19 +34,19 @@ pub(crate) struct ScheduledStopRef {
 
 #[derive(Clone, Debug)]
 struct WeeklyCalendar {
-    start_date: NaiveDate,
-    end_date: NaiveDate,
+    start_date: Date,
+    end_date: Date,
     weekdays: u8,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ServiceRule {
     weekly: Option<WeeklyCalendar>,
-    exceptions: HashMap<NaiveDate, bool>,
+    exceptions: HashMap<Date, bool>,
 }
 
 impl ServiceRule {
-    pub fn runs_on(&self, date: NaiveDate) -> bool {
+    pub fn runs_on(&self, date: Date) -> bool {
         if let Some(added) = self.exceptions.get(&date) {
             return *added;
         }
@@ -59,13 +59,13 @@ impl ServiceRule {
         }
 
         let bit = match date.weekday() {
-            Weekday::Mon => 1 << 0,
-            Weekday::Tue => 1 << 1,
-            Weekday::Wed => 1 << 2,
-            Weekday::Thu => 1 << 3,
-            Weekday::Fri => 1 << 4,
-            Weekday::Sat => 1 << 5,
-            Weekday::Sun => 1 << 6,
+            Weekday::Monday => 1 << 0,
+            Weekday::Tuesday => 1 << 1,
+            Weekday::Wednesday => 1 << 2,
+            Weekday::Thursday => 1 << 3,
+            Weekday::Friday => 1 << 4,
+            Weekday::Saturday => 1 << 5,
+            Weekday::Sunday => 1 << 6,
         };
         weekly.weekdays & bit != 0
     }
@@ -228,7 +228,7 @@ impl MartaScheduleIndex {
 
         let mut services = HashMap::with_capacity(used_service_ids.len());
         for service_id in used_service_ids {
-            let weekly = gtfs.calendar.get(&service_id).map(|calendar| {
+            let weekly = gtfs.calendar.get(&service_id).and_then(|calendar| {
                 let mut weekdays = 0u8;
                 if calendar.monday { weekdays |= 1 << 0; }
                 if calendar.tuesday { weekdays |= 1 << 1; }
@@ -237,20 +237,23 @@ impl MartaScheduleIndex {
                 if calendar.friday { weekdays |= 1 << 4; }
                 if calendar.saturday { weekdays |= 1 << 5; }
                 if calendar.sunday { weekdays |= 1 << 6; }
-                WeeklyCalendar {
-                    start_date: calendar.start_date,
-                    end_date: calendar.end_date,
+                // gtfs-structures exposes Chrono dates; convert once at index build.
+                Some(WeeklyCalendar {
+                    start_date: calendar.start_date.to_string().parse::<Date>().ok()?,
+                    end_date: calendar.end_date.to_string().parse::<Date>().ok()?,
                     weekdays,
-                }
+                })
             });
 
             let mut exceptions = HashMap::new();
             if let Some(calendar_dates) = gtfs.calendar_dates.get(&service_id) {
                 for exception in calendar_dates {
-                    exceptions.insert(
-                        exception.date,
-                        matches!(exception.exception_type, Exception::Added),
-                    );
+                    if let Ok(date) = exception.date.to_string().parse::<Date>() {
+                        exceptions.insert(
+                            date,
+                            matches!(exception.exception_type, Exception::Added),
+                        );
+                    }
                 }
             }
 
@@ -393,5 +396,31 @@ fn add_stop_aliases(
                 aliases.entry(shorter.to_string()).or_default().push(station_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+    use jiff::civil::date;
+
+    #[test]
+    fn weekly_calendar_and_exceptions_use_local_service_dates() {
+        let rule = ServiceRule {
+            weekly: Some(WeeklyCalendar {
+                start_date: date(2026, 9, 14),
+                end_date: date(2026, 9, 20),
+                weekdays: 0b0001_1111,
+            }),
+            exceptions: HashMap::from([
+                (date(2026, 9, 15), false),
+                (date(2026, 9, 19), true),
+            ]),
+        };
+        assert!(rule.runs_on(date(2026, 9, 14)));
+        assert!(!rule.runs_on(date(2026, 9, 15)));
+        assert!(rule.runs_on(date(2026, 9, 19)));
+        assert!(!rule.runs_on(date(2026, 9, 20)));
+        assert!(!rule.runs_on(date(2026, 9, 21)));
     }
 }
