@@ -1,38 +1,56 @@
-use chrono::{DateTime, Duration, LocalResult, NaiveDateTime, NaiveTime, TimeZone};
-use chrono_tz::{America::New_York, Tz};
+use jiff::civil::{DateTime, Time};
+use jiff::tz::{TimeZone, TimeZoneDatabase};
+use jiff::{SignedDuration, Span, Timestamp};
+use std::sync::LazyLock;
 
-pub(crate) const MARTA_TIMEZONE: Tz = New_York;
+// Use the bundled IANA data to preserve the old dependency's behavior on every host.
+pub(crate) static MARTA_TIMEZONE: LazyLock<TimeZone> = LazyLock::new(|| {
+    TimeZoneDatabase::bundled()
+        .get("America/New_York")
+        .expect("America/New_York is present in the bundled IANA time zone database")
+});
 
-pub(crate) fn parse_event_time(value: &str) -> Option<DateTime<Tz>> {
-    let naive = NaiveDateTime::parse_from_str(value.trim(), "%m/%d/%Y %I:%M:%S %p").ok()?;
-    localize(naive)
+pub(crate) fn parse_event_time(value: &str) -> Option<Timestamp> {
+    let local = DateTime::strptime("%m/%d/%Y %I:%M:%S %p", value.trim()).ok()?;
+    localize(local)
 }
 
 pub(crate) fn parse_next_arrival(
-    event: &DateTime<Tz>,
+    event: &Timestamp,
     next_arr: &str,
     waiting_seconds: Option<i64>,
-) -> Option<DateTime<Tz>> {
-    let next_time = NaiveTime::parse_from_str(next_arr.trim(), "%I:%M:%S %p").ok()?;
-    let event_naive = event.naive_local();
-    let base = event_naive.date().and_time(next_time);
+) -> Option<Timestamp> {
+    let next_time = Time::strptime("%I:%M:%S %p", next_arr.trim()).ok()?;
+    let event_local = MARTA_TIMEZONE.to_datetime(*event);
+    let base = event_local.date().at(
+        next_time.hour(),
+        next_time.minute(),
+        next_time.second(),
+        0,
+    );
 
+    // Compare wall-clock times, as before: service dates and GTFS stop times
+    // are local civil dates/times, including service-day overflow past 24:00.
+    let day = Span::new().days(1);
     let candidates = [
-        base - Duration::days(1),
-        base,
-        base + Duration::days(1),
+        base.checked_sub(day).ok(),
+        Some(base),
+        base.checked_add(day).ok(),
     ];
 
     let chosen = if let Some(wait) = waiting_seconds {
-        let target = event_naive + Duration::seconds(wait);
+        let target = event_local.checked_add(SignedDuration::from_secs(wait)).ok()?;
         candidates
             .into_iter()
-            .min_by_key(|candidate| (*candidate - target).num_seconds().abs())?
+            .flatten()
+            .min_by_key(|candidate| candidate.duration_since(target).as_secs().abs())?
     } else {
+        let earliest = event_local.checked_sub(SignedDuration::from_secs(120)).ok()?;
         candidates
             .into_iter()
-            .filter(|candidate| *candidate >= event_naive - Duration::minutes(2))
-            .min_by_key(|candidate| (*candidate - event_naive).num_seconds().abs())?
+            .flatten()
+            .filter(|candidate| *candidate >= earliest)
+            .min_by_key(|candidate| candidate.duration_since(event_local).as_secs().abs())?
     };
 
     localize(chosen)
@@ -95,18 +113,16 @@ pub(crate) fn parse_delay_seconds(value: &str) -> Option<i64> {
     saw_unit.then_some(sign * seconds)
 }
 
-fn localize(naive: NaiveDateTime) -> Option<DateTime<Tz>> {
-    match MARTA_TIMEZONE.from_local_datetime(&naive) {
-        LocalResult::Single(dt) => Some(dt),
-        LocalResult::Ambiguous(first, _) => Some(first),
-        LocalResult::None => None,
-    }
+fn localize(local: DateTime) -> Option<Timestamp> {
+    // Choose the first occurrence in a fall-back fold. In a spring-forward
+    // gap, reject the input instead of silently adjusting the wall-clock time.
+    let timestamp = MARTA_TIMEZONE.to_ambiguous_timestamp(local).earlier().ok()?;
+    (MARTA_TIMEZONE.to_datetime(timestamp) == local).then_some(timestamp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Timelike;
 
     #[test]
     fn parses_marta_delay() {
@@ -119,8 +135,53 @@ mod tests {
     fn next_arrival_crosses_midnight() {
         let event = parse_event_time("09/15/2026 11:59:50 PM").unwrap();
         let next = parse_next_arrival(&event, "12:04:00 AM", Some(250)).unwrap();
-        assert_eq!(next.date_naive().to_string(), "2026-09-16");
-        assert_eq!(next.hour(), 0);
-        assert_eq!(next.minute(), 4);
+        assert_eq!(next, "2026-09-16T04:04:00Z".parse::<Timestamp>().unwrap());
+        assert_eq!(
+            parse_next_arrival(&event, "12:04:00 AM", None),
+            Some(next)
+        );
+    }
+
+    #[test]
+    fn parses_eastern_standard_and_daylight_time() {
+        for (input, expected) in [
+            ("01/15/2026 1:04:00 PM", "2026-01-15T18:04:00Z"),
+            ("07/15/2026 01:04:00 PM", "2026-07-15T17:04:00Z"),
+        ] {
+            assert_eq!(parse_event_time(input), Some(expected.parse::<Timestamp>().unwrap()));
+        }
+        assert!(parse_event_time("not a timestamp").is_none());
+    }
+
+    #[test]
+    fn rejects_nonexistent_spring_forward_times() {
+        assert!(parse_event_time("03/08/2026 02:30:00 AM").is_none());
+        let event = parse_event_time("03/08/2026 01:55:00 AM").unwrap();
+        assert!(parse_next_arrival(&event, "02:30:00 AM", Some(2100)).is_none());
+    }
+
+    #[test]
+    fn fall_back_chooses_first_occurrence() {
+        let expected = "2026-11-01T05:30:00Z".parse::<Timestamp>().unwrap();
+        assert_eq!(parse_event_time("11/01/2026 01:30:00 AM"), Some(expected));
+        let event = parse_event_time("11/01/2026 01:20:00 AM").unwrap();
+        assert_eq!(parse_next_arrival(&event, "01:30:00 AM", Some(600)), Some(expected));
+        assert_eq!(
+            parse_event_time("11/01/2026 02:30:00 AM"),
+            Some("2026-11-01T07:30:00Z".parse::<Timestamp>().unwrap())
+        );
+    }
+
+    #[test]
+    fn missing_wait_allows_recent_past_prediction() {
+        let event = parse_event_time("07/15/2026 01:04:00 PM").unwrap();
+        assert_eq!(
+            parse_next_arrival(&event, "01:03:00 PM", None),
+            Some("2026-07-15T17:03:00Z".parse::<Timestamp>().unwrap())
+        );
+        assert_eq!(
+            parse_next_arrival(&event, "01:01:00 PM", None),
+            Some("2026-07-16T17:01:00Z".parse::<Timestamp>().unwrap())
+        );
     }
 }

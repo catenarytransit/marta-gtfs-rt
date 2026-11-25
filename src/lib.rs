@@ -16,7 +16,7 @@ pub use models::MartaTrainRow;
 use crate::index::{normalize_line, normalize_station_name, TripIndex};
 use crate::matcher::{group_live_rows, match_train};
 use crate::time::{parse_delay_seconds, parse_event_time, parse_next_arrival};
-use chrono::NaiveDate;
+use jiff::{civil::Date, Timestamp};
 use gtfs_realtime::trip_update::{StopTimeEvent, StopTimeUpdate};
 use gtfs_realtime::{
     FeedEntity, FeedHeader, FeedMessage, Position, TripDescriptor, TripUpdate, VehicleDescriptor,
@@ -26,7 +26,6 @@ use gtfs_structures::Gtfs;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MARTA_RAIL_REALTIME_URL: &str = "https://developerservices.itsmarta.com:18096/itsmarta/railrealtimearrivals/developerservices/traindata";
 
@@ -71,7 +70,7 @@ pub struct MartaGtfsRtResults {
 #[derive(Clone, Debug)]
 struct CachedAssignment {
     trip_index: TripIndex,
-    service_date: NaiveDate,
+    service_date: Date,
     line: String,
     direction: String,
     destination: String,
@@ -139,7 +138,7 @@ impl MartaGtfsRt {
             let destination = normalize_station_name(&first.destination);
             let latest_event_unix = group
                 .iter()
-                .filter_map(|row| parse_event_time(&row.event_time).map(|time| time.timestamp()))
+                .filter_map(|row| parse_event_time(&row.event_time).map(|time| time.as_second()))
                 .max()
                 .unwrap_or_else(current_unix_i64);
 
@@ -171,7 +170,7 @@ impl MartaGtfsRt {
                 route_id: Some(trip.route_id.clone()),
                 direction_id: trip.direction_id,
                 start_time: None,
-                start_date: Some(matched.service_date.format("%Y%m%d").to_string()),
+                start_date: Some(matched.service_date.strftime("%Y%m%d").to_string()),
                 schedule_relationship: None,
                 modified_trip: None,
             };
@@ -201,7 +200,7 @@ impl MartaGtfsRt {
                     stop_id: Some(stop_id),
                     arrival: Some(StopTimeEvent {
                         delay: delay.and_then(|value| i32::try_from(value).ok()),
-                        time: Some(predicted_arrival.timestamp()),
+                        time: Some(predicted_arrival.as_second()),
                         uncertainty: None,
                         scheduled_time: None,
                     }),
@@ -237,7 +236,7 @@ impl MartaGtfsRt {
                     let event = parse_event_time(&row.event_time)?;
                     let lat = row.latitude.as_deref()?.trim().parse::<f32>().ok()?;
                     let lon = row.longitude.as_deref()?.trim().parse::<f32>().ok()?;
-                    Some((event.timestamp(), lat, lon))
+                    Some((event.as_second(), lat, lon))
                 })
                 .max_by_key(|(timestamp, _, _)| *timestamp)
                 .map(|(_, lat, lon)| Position {
@@ -333,21 +332,13 @@ fn feed_header() -> FeedHeader {
     FeedHeader {
         gtfs_realtime_version: "2.0".to_string(),
         incrementality: None,
-        timestamp: Some(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        ),
+        timestamp: Some(u64::try_from(current_unix_i64()).unwrap_or_default()),
         feed_version: None,
     }
 }
 
 fn current_unix_i64() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    Timestamp::now().as_second().max(0)
 }
 
 #[cfg(test)]
